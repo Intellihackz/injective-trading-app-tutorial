@@ -14,11 +14,25 @@ import {
   ChainRestAuthApi,
   createTransaction,
   getDefaultSubaccountId,
-  TxRestApi,
 } from "@injectivelabs/sdk-ts";
 import { getNetworkEndpoints, Network } from "@injectivelabs/networks";
 import { useState, useEffect, useRef } from "react";
-
+import {
+  getEip712TypedData,
+  createWeb3Extension,
+  createTxRawEIP712,
+  SIGN_AMINO,
+  hexToBase64,
+  recoverTypedSignaturePubKey,
+  ChainRestTendermintApi,
+} from "@injectivelabs/sdk-ts";
+import { EvmChainId, ChainId } from '@injectivelabs/ts-types'
+import {
+  BigNumberInBase,
+  DEFAULT_STD_FEE,
+  DEFAULT_BLOCK_TIMEOUT_HEIGHT,
+} from "@injectivelabs/utils";
+import { TxGrpcApi } from "@injectivelabs/sdk-ts";
 
 interface TradingPair {
   marketId: string;
@@ -100,34 +114,42 @@ const formatSmallPrice = (price: number, quoteSymbol: string = "$"): string => {
   if (price >= 0.0001) {
     return `${price.toFixed(4)}`;
   }
-  
+
   // Convert to string to count leading zeros
-  const priceStr = price.toFixed(20).replace(/\.?0+$/, ''); // Remove trailing zeros
+  const priceStr = price.toFixed(20).replace(/\.?0+$/, ""); // Remove trailing zeros
   const match = priceStr.match(/^0\.0+/);
-  
+
   if (!match) return `${price}`;
-  
+
   const leadingZeros = match[0].length - 2; // Subtract "0."
-  
+
   // Limit to max 9 leading zeros before showing 0.0₉ format
   if (leadingZeros > 9) {
     // For 10+ zeros, use scientific notation or show as 0.0₉ with adjusted significant digits
     const adjustedZeros = Math.min(leadingZeros, 9);
     const startPos = match[0].length + (leadingZeros - adjustedZeros);
     const significantDigits = priceStr.slice(startPos).slice(0, 4);
-    
-    const subscripts = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
-    const zeroCount = adjustedZeros.toString().split('').map(d => subscripts[parseInt(d)]).join('');
-    
+
+    const subscripts = ["₀", "₁", "₂", "₃", "₄", "₅", "₆", "₇", "₈", "₉"];
+    const zeroCount = adjustedZeros
+      .toString()
+      .split("")
+      .map((d) => subscripts[parseInt(d)])
+      .join("");
+
     return `0.0${zeroCount}${significantDigits}`;
   }
-  
+
   const significantDigits = priceStr.slice(match[0].length).slice(0, 4);
-  
+
   // Use subscript numbers: ₀₁₂₃₄₅₆₇₈₉
-  const subscripts = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
-  const zeroCount = leadingZeros.toString().split('').map(d => subscripts[parseInt(d)]).join('');
-  
+  const subscripts = ["₀", "₁", "₂", "₃", "₄", "₅", "₆", "₇", "₈", "₉"];
+  const zeroCount = leadingZeros
+    .toString()
+    .split("")
+    .map((d) => subscripts[parseInt(d)])
+    .join("");
+
   return `0.0${zeroCount}${significantDigits}`;
 };
 
@@ -168,14 +190,17 @@ function App() {
   const [orderError, setOrderError] = useState<string>("");
   const [orderSuccess, setOrderSuccess] = useState<string>("");
 
+  // Account state for transaction signing
+  const [accountNumber, setAccountNumber] = useState<number>(0);
+  const [sequence, setSequence] = useState<number>(0);
+
   // Initialize Injective API
   const endpoints = getNetworkEndpoints(Network.Testnet);
   const indexerGrpcSpotApi = new IndexerGrpcSpotApi(endpoints.indexer);
   const indexerGrpcSpotStream = new IndexerGrpcSpotStream(endpoints.indexer);
   const chainRestBankApi = new ChainRestBankApi(endpoints.rest);
   const chainGrpcExchangeApi = new ChainGrpcExchangeApi(endpoints.grpc);
-  const restEndpoint = getNetworkEndpoints(Network.Testnet).rest;
-
+  // const restEndpoint = getNetworkEndpoints(Network.Testnet).rest;
 
   // Debug: Log when orderbook state changes
   useEffect(() => {
@@ -193,6 +218,8 @@ function App() {
       const primaryAddress = injectiveAddresses[0];
       console.log("Fetching user data for address:", primaryAddress);
 
+      // Fetch account details (account number and sequence)
+      fetchAccountDetails(primaryAddress);
       // Fetch balances and positions
       fetchUserBalances(primaryAddress);
       fetchUserPositions(primaryAddress);
@@ -325,7 +352,9 @@ function App() {
             const bestAsk = parseFloat(processedSellOrders[0].price);
             const midPrice = (bestBid + bestAsk) / 2;
             setCurrentPrice(midPrice);
-            console.log(`Current price updated: ${midPrice} (Bid: ${bestBid}, Ask: ${bestAsk})`);
+            console.log(
+              `Current price updated: ${midPrice} (Bid: ${bestBid}, Ask: ${bestAsk})`
+            );
           } else if (processedBuyOrders.length > 0) {
             // Only buy orders available, use best bid
             const bestBid = parseFloat(processedBuyOrders[0].price);
@@ -478,6 +507,38 @@ function App() {
     }
   };
 
+  const fetchAccountDetails = async (injectiveAddress: string) => {
+    try {
+      console.log("Fetching account details for address:", injectiveAddress);
+      const rest = getNetworkEndpoints(Network.Testnet).rest;
+      const chainRestAuthApi = new ChainRestAuthApi(rest);
+      const accountDetailsResponse = await chainRestAuthApi.fetchAccount(
+        injectiveAddress
+      );
+      const baseAccount =
+        accountDetailsResponse.account.base_account ||
+        accountDetailsResponse.account;
+
+      const fetchedAccountNumber = parseInt(baseAccount.account_number);
+      const fetchedSequence = parseInt(baseAccount.sequence);
+
+      setAccountNumber(fetchedAccountNumber);
+      setSequence(fetchedSequence);
+
+      console.log("Account details refreshed:", {
+        accountNumber: fetchedAccountNumber,
+        sequence: fetchedSequence,
+      });
+    } catch (err) {
+      console.error("Failed to fetch account details:", err);
+      setUserPanelError(
+        `Failed to fetch account details: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+    }
+  };
+
   const fetchUserPositions = async (injectiveAddress: string) => {
     try {
       setPositionsLoading(true);
@@ -563,7 +624,8 @@ function App() {
 
   const calculateTotal = () => {
     // Use current price for market orders, user input for limit orders
-    const priceNum = orderType === "market" ? currentPrice : parseFloat(price || "0");
+    const priceNum =
+      orderType === "market" ? currentPrice : parseFloat(price || "0");
     const quantityNum = parseFloat(quantity || "0");
     return priceNum * quantityNum;
   };
@@ -588,16 +650,17 @@ function App() {
       return;
     }
 
-    // Validate price based on order type
+    // Validate price
     if (orderType === "limit") {
       if (!price || parseFloat(price) <= 0) {
         setOrderError("Please enter a valid price for limit order");
         return;
       }
     } else {
-      // Market order - check if current price is available
       if (currentPrice <= 0) {
-        setOrderError("Market price not available yet. Please wait for orderbook to load.");
+        setOrderError(
+          "Market price not available yet. Please wait for orderbook to load."
+        );
         return;
       }
     }
@@ -608,8 +671,9 @@ function App() {
       setOrderSuccess("");
 
       const injectiveAddress = injectiveAddresses[0];
+      const ethereumAddress = getEthereumAddress(injectiveAddress);
 
-      // Get market details for order creation
+      /** Market setup */
       const market = {
         marketId: currentMarket.marketId,
         baseDecimals: currentMarket.baseToken?.decimals || 18,
@@ -618,47 +682,29 @@ function App() {
         minQuantityTickSize: currentMarket.minQuantityTickSize,
       };
 
-      // Get market multipliers
       const tensMultipliers = getSpotMarketTensMultiplier({
         baseDecimals: market.baseDecimals,
         quoteDecimals: market.quoteDecimals,
         minPriceTickSize: market.minPriceTickSize,
         minQuantityTickSize: market.minQuantityTickSize,
       });
+
       const marketWithMultipliers = {
         ...market,
         priceTensMultiplier: tensMultipliers.priceTensMultiplier,
         quantityTensMultiplier: tensMultipliers.quantityTensMultiplier,
       };
 
-      console.log("Market conversion details:", {
-        marketId: market.marketId,
-        baseDecimals: market.baseDecimals,
-        quoteDecimals: market.quoteDecimals,
-        priceTensMultiplier: tensMultipliers.priceTensMultiplier,
-        quantityTensMultiplier: tensMultipliers.quantityTensMultiplier,
-        decimalsDifference: market.quoteDecimals - market.baseDecimals,
-      });
-
-      // Create subaccount ID
-      const ethereumAddress = getEthereumAddress(injectiveAddress);
+      // Subaccount setup
       const subaccountIndex = 0;
       const suffix = "0".repeat(23) + subaccountIndex;
       const subaccountId = ethereumAddress + suffix;
-
-      // Determine order type (1 = Buy, 2 = Sell)
       const orderTypeValue = orderSide === "buy" ? 1 : 2;
-
-      // Fee recipient (can be the same as injective address or empty)
       const feeRecipient = injectiveAddress;
 
       let msg;
-
       if (orderType === "limit") {
         const limitPrice = parseFloat(price);
-        console.log("Limit order - Using price from input:", limitPrice);
-
-        // Convert price to chain format
         const chainPrice = spotPriceToChainPriceToFixed({
           value: limitPrice,
           tensMultiplier: marketWithMultipliers.priceTensMultiplier,
@@ -666,30 +712,12 @@ function App() {
           quoteDecimals: marketWithMultipliers.quoteDecimals,
         });
 
-        // Convert quantity to chain format
         const chainQuantity = spotQuantityToChainQuantityToFixed({
           value: parseFloat(quantity),
           tensMultiplier: marketWithMultipliers.quantityTensMultiplier,
           baseDecimals: marketWithMultipliers.baseDecimals,
         });
 
-        console.log("Price conversion:", {
-          originalPrice: limitPrice,
-          chainPrice: chainPrice,
-          formula: `${limitPrice} × 10^(${
-            marketWithMultipliers.quoteDecimals
-          } - ${marketWithMultipliers.baseDecimals}) = ${limitPrice} × 10^${
-            marketWithMultipliers.quoteDecimals -
-            marketWithMultipliers.baseDecimals
-          }`,
-        });
-
-        console.log("Quantity conversion:", {
-          originalQuantity: parseFloat(quantity),
-          chainQuantity: chainQuantity,
-        });
-
-        // Create limit order
         msg = MsgCreateSpotLimitOrder.fromJSON({
           subaccountId,
           injectiveAddress,
@@ -697,28 +725,10 @@ function App() {
           price: chainPrice,
           quantity: chainQuantity,
           marketId: marketWithMultipliers.marketId,
-          feeRecipient: feeRecipient,
+          feeRecipient,
         });
       } else {
-        // Market order - use current mid-market price
         const marketPrice = currentPrice;
-        
-        console.log(`Market ${orderSide.toUpperCase()} order - Current price check:`, {
-          currentPrice,
-          marketPrice,
-          buyOrdersLength: buyOrders.length,
-          sellOrdersLength: sellOrders.length,
-          bestBid: buyOrders[0]?.price,
-          bestAsk: sellOrders[0]?.price,
-        });
-
-        if (marketPrice <= 0 || isNaN(marketPrice)) {
-          throw new Error(`Invalid market price: ${marketPrice}. Orderbook may not be loaded.`);
-        }
-
-        console.log(`Using market price: ${marketPrice}`);
-
-        // Convert price to chain format
         const chainPrice = spotPriceToChainPriceToFixed({
           value: marketPrice,
           tensMultiplier: marketWithMultipliers.priceTensMultiplier,
@@ -726,24 +736,13 @@ function App() {
           quoteDecimals: marketWithMultipliers.quoteDecimals,
         });
 
-        // Convert quantity to chain format
         const chainQuantity = spotQuantityToChainQuantityToFixed({
           value: parseFloat(quantity),
           tensMultiplier: marketWithMultipliers.quantityTensMultiplier,
           baseDecimals: marketWithMultipliers.baseDecimals,
         });
 
-        console.log("Market order price conversion:", {
-          originalPrice: marketPrice,
-          chainPrice: chainPrice,
-          chainPriceType: typeof chainPrice,
-          formula: `${marketPrice} × 10^(${
-            marketWithMultipliers.quoteDecimals
-          } - ${marketWithMultipliers.baseDecimals}) = ${marketPrice} × 10^${
-            marketWithMultipliers.quoteDecimals -
-            marketWithMultipliers.baseDecimals
-          }`,
-        });
+        console.log(marketPrice , chainPrice)
 
         msg = MsgCreateSpotMarketOrder.fromJSON({
           subaccountId,
@@ -752,117 +751,104 @@ function App() {
           price: chainPrice,
           quantity: chainQuantity,
           marketId: marketWithMultipliers.marketId,
-          feeRecipient: feeRecipient,
+          feeRecipient,
         });
       }
 
-      // Broadcast the transaction using MetaMask
-      console.log("Order message created:", msg);
-      console.log("Market details:", marketWithMultipliers);
+      /** --- EIP712 SIGNING FLOW START --- **/
+      const chainId = ChainId.Testnet; // Testnet
+      const evmChainID = EvmChainId.TestnetEvm; // Injective EVM chain ID
+      const rest = getNetworkEndpoints(Network.Testnet).rest;
 
-      try {
-        // Get account details for transaction creation
-        const accountDetailsApi = new ChainRestAuthApi(endpoints.rest);
-        const accountDetails = await accountDetailsApi.fetchAccount(
-          injectiveAddress
-        );
+      // Use state variables for account number and sequence
+      const currentAccountNumber = accountNumber;
+      const currentSequence = sequence;
 
-        console.log("Account details:", accountDetails);
+      console.log("Using account details for transaction:", {
+        accountNumber: currentAccountNumber,
+        sequence: currentSequence,
+      });
 
-        // Access the account properties correctly based on the API response structure
-        const baseAccount =
-          accountDetails.account.base_account || accountDetails.account;
-        const pubKey = baseAccount.pub_key?.key || "";
-        const sequence = parseInt(baseAccount.sequence, 10);
-        const accountNumber = parseInt(baseAccount.account_number, 10);
+      const chainRestTendermintApi = new ChainRestTendermintApi(rest);
+      const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
+      const latestHeight = latestBlock.header.height;
+      const timeoutHeight = new BigNumberInBase(latestHeight).plus(
+        DEFAULT_BLOCK_TIMEOUT_HEIGHT
+      );
 
-        // Create transaction with the order message
-        const { signBytes, txRaw } = createTransaction({
-          message: msg,
-          memo: `${orderType.toUpperCase()} ${orderSide.toUpperCase()} order via Injective Trading App`,
-          fee: {
-            amount: [
-              {
-                amount: "400000000000000000", // 0.4 INJ
-                denom: "inj",
-              },
-            ],
-            gas: "400000",
-          },
-          pubKey: pubKey,
-          sequence: sequence,
-          accountNumber: accountNumber,
-          chainId: "injective-888", // Testnet chain ID
-        });
+      // Create EIP712 typed data
+      const eip712TypedData = getEip712TypedData({
+        msgs: [msg],
+        tx: {
+          accountNumber: currentAccountNumber.toString(),
+          sequence: currentSequence.toString(),
+          timeoutHeight: timeoutHeight.toFixed(),
+          chainId,
+        },
+        evmChainId: evmChainID,
+      });
 
-        // Sign the transaction using MetaMask
-        console.log("Requesting signature from MetaMask...");
-        console.log("Sign bytes:", signBytes);
+      // Ask MetaMask to sign
+      const ethereum = getEthereum();
+      const signature = await ethereum.request({
+        method: "eth_signTypedData_v4",
+        params: [addresses[0], JSON.stringify(eip712TypedData)],
+      });
 
-        const ethereum = getEthereum();
+      // Recover public key
+      const publicKeyHex = recoverTypedSignaturePubKey(
+        eip712TypedData,
+        signature
+      );
+      const publicKeyBase64 = hexToBase64(publicKeyHex);
+      const signatureBuff = Buffer.from(signature.replace("0x", ""), "hex");
 
-        // Convert signBytes to hex format for MetaMask signing
-        const signBytesHex = "0x" + Buffer.from(signBytes).toString("hex");
+      // Create tx
+      const { txRaw } = createTransaction({
+        message: [msg],
+        memo: `${orderType.toUpperCase()} ${orderSide.toUpperCase()} order via Injective Trading App`,
+        signMode: SIGN_AMINO,
+        fee: DEFAULT_STD_FEE,
+        pubKey: publicKeyBase64,
+        sequence: currentSequence,
+        timeoutHeight: timeoutHeight.toNumber(),
+        accountNumber: currentAccountNumber,
+        chainId,
+      });
 
-        const signature = await ethereum.request({
-          method: "personal_sign",
-          params: [signBytesHex, addresses[0]], // Use the EVM address for signing
-        });
+      const web3Extension = createWeb3Extension({ evmChainId: evmChainID });
+      const txRawEip712 = createTxRawEIP712(txRaw, web3Extension);
 
-        console.log("Signature received:", signature);
+      // Attach signature
+      txRawEip712.signatures = [signatureBuff];
 
-        // Create the properly formatted transaction with signature
-        const signedTxRaw = {
-          ...txRaw,
-          signatures: [Buffer.from(signature.slice(2), "hex")], // Remove '0x' prefix and convert to Buffer
-        };
+      // Broadcast
+      const txRestApi = new TxGrpcApi(rest);
+      console.log("Broadcasting EIP712 transaction:", txRestApi);
+      const txResponse = await txRestApi.broadcast(txRawEip712);
+      console.log("Transaction broadcast response:", txResponse);
+      const response = await txRestApi.fetchTxPoll(txResponse.txHash);
 
-        console.log("Signed transaction prepared:", signedTxRaw);
+      console.log("✅ EIP712 Transaction broadcast response:", response);
 
-        /** Broadcast the Transaction */
-        const txRestApi = new TxRestApi(restEndpoint);
+      // CRITICAL: Increment sequence after successful broadcast
+      setSequence((prev) => prev + 1);
+      console.log("Sequence incremented to:", sequence + 1);
 
-        const txResponse = await txRestApi.broadcast(signedTxRaw);
-        const response = await txRestApi.fetchTxPoll(txResponse.txHash);
-        console.log(response)
-        // For now, we'll show success since the transaction is properly signed
-        // The actual broadcasting would need proper transaction encoding
-        setOrderSuccess(`✅ Order signed successfully!
-                        Market: ${currentMarket.ticker}
-                        Type: ${orderType.toUpperCase()} ${orderSide.toUpperCase()}
-                        Quantity: ${quantity}
-                        ${
-                          orderType === "limit"
-                            ? `Price: ${price}`
-                            : "Market Order"
-                        }
-                        
-                        Transaction has been signed with MetaMask.
-                        Broadcasting functionality can be enhanced with proper SDK integration.
-                        Check console for transaction details.`);
+      setOrderSuccess(
+        `✅ Order broadcasted successfully!\nTx Hash: ${txResponse.txHash}`
+      );
 
-        // Clear form
-        setPrice("");
-        setQuantity("");
+      // Reset inputs
+      setPrice("");
+      setQuantity("");
 
-        // Refresh user data
-        setTimeout(() => {
-          refreshUserData();
-        }, 2000);
-      } catch (broadcastError) {
-        console.error("Error broadcasting transaction:", broadcastError);
-        setOrderError(
-          `Failed to broadcast transaction: ${
-            broadcastError instanceof Error
-              ? broadcastError.message
-              : "Unknown error"
-          }`
-        );
-      }
+      // Refresh user data
+      setTimeout(() => refreshUserData(), 2000);
     } catch (err) {
-      console.error("Error creating order:", err);
+      console.error("❌ Error placing order:", err);
       setOrderError(
-        err instanceof Error ? err.message : "Failed to create order"
+        err instanceof Error ? err.message : "Failed to place order"
       );
     } finally {
       setIsPlacingOrder(false);
@@ -1053,10 +1039,16 @@ function App() {
                           onClick={() => handlePriceClick(order.price)}
                         >
                           <span className="price">
-                            {formatSmallPrice(parseFloat(order.price), getQuoteSymbol())}
+                            {formatSmallPrice(
+                              parseFloat(order.price),
+                              getQuoteSymbol()
+                            )}
                           </span>
                           <span className="quantity">
-                            {parseFloat(order.quantity).toFixed(2)}
+                            {formatSmallPrice(
+                              parseFloat(order.quantity),
+                              ""
+                            )}
                           </span>
                         </div>
                       ))}
@@ -1068,9 +1060,12 @@ function App() {
                   {/* Current Price */}
                   <div className="current-price">
                     <span>
-                      {currentPrice > 0 
-                        ? `${formatSmallPrice(currentPrice, getQuoteSymbol())} ${getQuoteSymbol()}` 
-                        : 'CURRENT: --'}
+                      {currentPrice > 0
+                        ? `${formatSmallPrice(
+                            currentPrice,
+                            getQuoteSymbol()
+                          )} ${getQuoteSymbol()}`
+                        : "CURRENT: --"}
                     </span>
                   </div>
 
@@ -1083,10 +1078,16 @@ function App() {
                         onClick={() => handlePriceClick(order.price)}
                       >
                         <span className="price">
-                          {formatSmallPrice(parseFloat(order.price), getQuoteSymbol())}
+                          {formatSmallPrice(
+                            parseFloat(order.price),
+                            getQuoteSymbol()
+                          )}
                         </span>
                         <span className="quantity">
-                          {parseFloat(order.quantity).toFixed(2)}
+                          {formatSmallPrice(
+                            parseFloat(order.quantity),
+                            ""
+                          )}
                         </span>
                       </div>
                     ))}
@@ -1150,30 +1151,39 @@ function App() {
                 <label>Price ({getQuoteSymbol()})</label>
                 <input
                   type="number"
-                  value={orderType === "market" ? currentPrice.toFixed(6) : price}
+                  value={
+                    orderType === "market" ? currentPrice.toFixed(6) : price
+                  }
                   onChange={(e) => setPrice(e.target.value)}
                   disabled={orderType === "market"}
                   placeholder="0.000"
                   step="0.001"
                 />
                 {orderType === "limit" && price && parseFloat(price) > 0 && (
-                  <div style={{ 
-                    fontSize: "0.85rem", 
-                    color: "#666", 
-                    marginTop: "4px",
-                    fontFamily: "monospace"
-                  }}>
-                    ≈ {formatSmallPrice(parseFloat(price), getQuoteSymbol())} {getQuoteSymbol()}
+                  <div
+                    style={{
+                      fontSize: "0.85rem",
+                      color: "#666",
+                      marginTop: "4px",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    ≈ {formatSmallPrice(parseFloat(price), getQuoteSymbol())}{" "}
+                    {getQuoteSymbol()}
                   </div>
                 )}
                 {orderType === "market" && currentPrice > 0 && (
-                  <div style={{ 
-                    fontSize: "0.85rem", 
-                    color: "#666", 
-                    marginTop: "4px",
-                    fontFamily: "monospace"
-                  }}>
-                    Using current market price: {formatSmallPrice(currentPrice, getQuoteSymbol())} {getQuoteSymbol()}
+                  <div
+                    style={{
+                      fontSize: "0.85rem",
+                      color: "#666",
+                      marginTop: "4px",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    Using current market price:{" "}
+                    {formatSmallPrice(currentPrice, getQuoteSymbol())}{" "}
+                    {getQuoteSymbol()}
                   </div>
                 )}
               </div>
@@ -1193,7 +1203,8 @@ function App() {
               {/* Total Calculation */}
               <div className="total-display">
                 <span>
-                  Total: {formatSmallPrice(calculateTotal(), getQuoteSymbol())} {getQuoteSymbol()}
+                  Total: {formatSmallPrice(calculateTotal(), getQuoteSymbol())}{" "}
+                  {getQuoteSymbol()}
                 </span>
               </div>
 
