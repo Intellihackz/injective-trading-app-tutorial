@@ -35,7 +35,14 @@ If you're missing any of these, no worries! You can pick them up as we go along.
 
 📁 **[View the complete source code on GitHub](https://github.com/Intellihackz/inject)**
 
-This tutorial focuses on key concepts and important code snippets. For the complete implementation with all files, styling, and additional features, check out the repository above.
+### 📖 How to Use This Tutorial
+
+This tutorial can be used in two ways:
+
+1. **Learning Mode** - Follow along step-by-step and build everything from scratch to understand how each piece works
+2. **Reference Mode** - If you've already cloned the completed repository, use this tutorial to understand the implementation details of each feature
+
+> **💡 Tip**: If you're working with the completed code, look for the **"📝 Note"** sections that indicate when functionality is already implemented. These sections explain how the existing code works rather than asking you to write it.
 
 ## What We're Building
 
@@ -1148,57 +1155,187 @@ Next up, we'll implement the actual order placement logic - this is where we'll 
 
 ## Step 6: Making Orders Actually Work - Transaction Signing
 
-This is the exciting part where we connect our beautiful form to the actual blockchain! When users click "Place Order," we need to create a proper blockchain transaction, get it signed by MetaMask, and broadcast it to Injective.
+This is the exciting part where we connect our beautiful form to the actual blockchain! We'll build the complete order placement system step by step, so you understand every piece of the transaction flow.
 
-### Understanding Blockchain Trading
+> **📝 Note**: If you're following the completed repository code, this functionality is already implemented in your `App.tsx` file. This section explains how it works so you understand the transaction flow.
 
-Before we code, let me explain what happens when you place a trading order on a blockchain:
+## Understanding the Transaction Flow
 
-1. **Create the Message** - We build a transaction message with all the order details
-2. **Calculate Fees** - Every blockchain transaction requires gas fees
-3. **Sign with Wallet** - MetaMask signs the transaction to prove it's really from you
-4. **Broadcast** - We send the signed transaction to Injective's network
-5. **Confirmation** - The blockchain processes it and gives us a transaction hash
+Before we dive into the code, let me explain the complete journey of a blockchain transaction:
 
-Think of it like writing a cheque - you fill in the amount and recipient, sign it to authorize the payment, mail it to the payee, and the bank processes it to complete the transaction.
+1. **Validate Input** - Make sure all required fields are filled
+2. **Create Order Message** - Build the specific order (limit or market)
+3. **Fetch Account Info** - Get your account number and sequence (like a check number)
+4. **Create EIP712 Typed Data** - Format the transaction for MetaMask
+5. **Sign with MetaMask** - User approves the transaction
+6. **Recover Public Key** - Extract the public key from the signature
+7. **Build Transaction** - Package everything into a blockchain transaction
+8. **Broadcast** - Send it to Injective's network
+9. **Confirm** - Wait for blockchain confirmation
 
-### Step 6a: Setting Up Order State
+Think of it like mailing a certified letter - you write it, sign it, get it notarized, send it via certified mail, and track its delivery.
 
-First, let's add the [React state variables](https://react.dev/reference/react/useState) we need to track the order process:
+---
 
-```tsx
+### Step 6a: Additional Imports Needed
+
+First, let's make sure we have all the imports we need for transaction signing. Add these to your existing imports at the top of `App.tsx`:
+
+```typescript
 // filepath: src/App.tsx
-// Add these with your other state declarations
+import {
+  getEip712TypedData,
+  createWeb3Extension,
+  createTxRawEIP712,
+  SIGN_AMINO,
+  hexToBase64,
+  recoverTypedSignaturePubKey,
+  ChainRestTendermintApi,
+  ChainRestAuthApi,
+} from "@injectivelabs/sdk-ts";
+import { EvmChainId, ChainId } from '@injectivelabs/ts-types';
+import {
+  BigNumberInBase,
+  DEFAULT_STD_FEE,
+  DEFAULT_BLOCK_TIMEOUT_HEIGHT,
+} from "@injectivelabs/utils";
+import { TxGrpcApi } from "@injectivelabs/sdk-ts";
+```
+
+These imports give us:
+
+- **EIP712 functions** - For creating MetaMask-compatible signatures
+- **Chain IDs** - Network identifiers for testnet/mainnet
+- **Transaction utilities** - Fee calculations and transaction building
+- **gRPC API** - For broadcasting transactions
+
+### Step 6b: Setting Up Order and Account State
+
+Add these state variables with your other state declarations:
+
+```typescript
+// filepath: src/App.tsx
+// Order placement state
 const [isPlacingOrder, setIsPlacingOrder] = useState(false);
 const [orderError, setOrderError] = useState<string>("");
 const [orderSuccess, setOrderSuccess] = useState<string>("");
+
+// Account state for transaction signing
+const [accountNumber, setAccountNumber] = useState<number>(0);
+const [sequence, setSequence] = useState<number>(0);
 ```
 
-These track:
+**Why do we need account number and sequence?**
 
-- `isPlacingOrder` - Show loading state while order is being processed
-- `orderError` - Any error messages to show the user
-- `orderSuccess` - Success message with transaction details
+- **Account Number**: A unique identifier for your account on Injective (never changes)
+- **Sequence**: A counter that increments with each transaction (prevents replay attacks)
 
-### Step 6b: Order Validation and Setup
+Think of sequence like a check number - each transaction needs a unique, sequential number.
 
-Let's start building our order placement function with proper validation:
+### Step 6c: Fetching and Auto-Loading Account Details
 
-```tsx
+Create a function to fetch your account information and set it up to load automatically when the wallet connects:
+
+```typescript
+// filepath: src/App.tsx
+const fetchAccountDetails = async (injectiveAddress: string) => {
+  try {
+    console.log("Fetching account details for address:", injectiveAddress);
+    
+    // Get REST endpoint for the network
+    const rest = getNetworkEndpoints(Network.Testnet).rest;
+    const chainRestAuthApi = new ChainRestAuthApi(rest);
+    
+    // Fetch account information from the blockchain
+    const accountDetailsResponse = await chainRestAuthApi.fetchAccount(
+      injectiveAddress
+    );
+    
+    // Extract base account info (handles different account types)
+    const baseAccount =
+      accountDetailsResponse.account.base_account ||
+      accountDetailsResponse.account;
+
+    // Parse and store account details
+    const fetchedAccountNumber = parseInt(baseAccount.account_number);
+    const fetchedSequence = parseInt(baseAccount.sequence);
+
+    setAccountNumber(fetchedAccountNumber);
+    setSequence(fetchedSequence);
+
+    console.log("Account details fetched:", {
+      accountNumber: fetchedAccountNumber,
+      sequence: fetchedSequence,
+    });
+  } catch (err) {
+    console.error("Failed to fetch account details:", err);
+    setUserPanelError(
+      `Failed to fetch account details: ${
+        err instanceof Error ? err.message : "Unknown error"
+      }`
+    );
+  }
+};
+
+// Auto-fetch account details when wallet connects
+useEffect(() => {
+  if (isConnected && injectiveAddresses.length > 0) {
+    const primaryAddress = injectiveAddresses[0];
+    console.log("Fetching user data for address:", primaryAddress);
+
+    // Fetch account details (account number and sequence)
+    fetchAccountDetails(primaryAddress);
+    // Fetch balances and positions
+    fetchUserBalances(primaryAddress);
+    fetchUserPositions(primaryAddress);
+  }
+}, [isConnected, injectiveAddresses, tradingPairs]);
+```
+
+**Key Points:**
+
+- We fetch account info from Injective's REST API whenever the wallet connects
+- Account number stays constant, but sequence increments with each transaction
+- We need fresh sequence data before every transaction
+- The useEffect ensures this happens automatically on connection
+
+### Step 6d: Building the Order Placement Function - Setup & Validation
+
+Now let's start building the complete `handlePlaceOrder` function. First, the setup and validation:
+
+```typescript
 // filepath: src/App.tsx
 const handlePlaceOrder = async () => {
-  // Validation checks
-  if (!price && orderType === "limit") return;
+  // Validate quantity
   if (!quantity) return;
+  
+  // Validate wallet connection
   if (!isConnected || injectiveAddresses.length === 0) {
     setOrderError("Please connect your wallet first");
     return;
   }
 
+  // Validate market selection
   const currentMarket = getCurrentPairData();
   if (!currentMarket) {
     setOrderError("Please select a market first");
     return;
+  }
+
+  // Validate price based on order type
+  if (orderType === "limit") {
+    if (!price || parseFloat(price) <= 0) {
+      setOrderError("Please enter a valid price for limit order");
+      return;
+    }
+  } else {
+    // For market orders, check if we have current price from orderbook
+    if (currentPrice <= 0) {
+      setOrderError(
+        "Market price not available yet. Please wait for orderbook to load."
+      );
+      return;
+    }
   }
 
   try {
@@ -1209,101 +1346,334 @@ const handlePlaceOrder = async () => {
     console.log("Starting order placement process...");
     
     const injectiveAddress = injectiveAddresses[0];
-    // ... rest of the function will be broken down below
+    const ethereumAddress = getEthereumAddress(injectiveAddress);
+```
+
+**What's happening here?**
+
+- We validate all required inputs before proceeding
+- We clear any previous error/success messages
+- We get both the Injective and Ethereum addresses (we need both!)
+
+### Step 6e: Market Configuration and Price Conversion
+
+Next, we need to configure the market and convert prices to blockchain format:
+
+```typescript
+    // Market configuration
+    const market = {
+      marketId: currentMarket.marketId,
+      baseDecimals: currentMarket.baseToken?.decimals || 18,
+      quoteDecimals: currentMarket.quoteToken?.decimals || 6,
+      minPriceTickSize: currentMarket.minPriceTickSize,
+      minQuantityTickSize: currentMarket.minQuantityTickSize,
+    };
+
+    // Get mathematical multipliers for price/quantity conversion
+    // These convert human-readable numbers to blockchain format
+    const tensMultipliers = getSpotMarketTensMultiplier({
+      baseDecimals: market.baseDecimals,
+      quoteDecimals: market.quoteDecimals,
+      minPriceTickSize: market.minPriceTickSize,
+      minQuantityTickSize: market.minQuantityTickSize,
+    });
+
+    const marketWithMultipliers = {
+      ...market,
+      priceTensMultiplier: tensMultipliers.priceTensMultiplier,
+      quantityTensMultiplier: tensMultipliers.quantityTensMultiplier,
+    };
+
+    console.log("Market configuration:", marketWithMultipliers);
+```
+
+**Why the complex conversion?**
+Blockchains store numbers as integers, but users think in decimals. For example:
+
+- User sees: `1.5 INJ`
+- Blockchain stores: `1500000000000000000` (1.5 × 10^18)
+
+The multipliers handle this conversion automatically.
+
+### Step 6f: Creating the Subaccount ID
+
+Now we create the subaccount ID (your trading account identifier):
+
+```typescript
+    // Subaccount setup
+    // Most users use subaccount index 0 (their default trading account)
+    const subaccountIndex = 0;
+    
+    // Create subaccount ID: ethereum address + 23 zeros + index
+    // Example: 0x1234...5678 + 00000000000000000000000 + 0
+    const suffix = "0".repeat(23) + subaccountIndex;
+    const subaccountId = ethereumAddress + suffix;
+    
+    console.log("Using subaccount ID:", subaccountId);
+```
+
+**What's a subaccount?**
+Think of subaccounts like having multiple trading accounts under one wallet. Most people just use subaccount 0, but advanced traders might use multiple subaccounts to separate different strategies.
+
+### Step 6g: Creating the Order Message - Limit Orders
+
+Now we create the actual order message. Let's handle limit orders first:
+
+```typescript
+    // Determine order type: 1 = Buy, 2 = Sell
+    const orderTypeValue = orderSide === "buy" ? 1 : 2;
+    const feeRecipient = injectiveAddress;
+
+    let msg; // This will hold our order message
+
+    if (orderType === "limit") {
+      console.log("Creating limit order message...");
+      
+const limitPrice = parseFloat(price);
+      
+      // Convert human-readable price to blockchain format
+      const chainPrice = spotPriceToChainPriceToFixed({
+        value: limitPrice,
+        tensMultiplier: marketWithMultipliers.priceTensMultiplier,
+        baseDecimals: marketWithMultipliers.baseDecimals,
+        quoteDecimals: marketWithMultipliers.quoteDecimals,
+      });
+
+      // Convert human-readable quantity to blockchain format
+      const chainQuantity = spotQuantityToChainQuantityToFixed({
+        value: parseFloat(quantity),
+        tensMultiplier: marketWithMultipliers.quantityTensMultiplier,
+        baseDecimals: marketWithMultipliers.baseDecimals,
+      });
+
+      console.log("Limit order details:", {
+        userPrice: limitPrice,
+        chainPrice,
+        userQuantity: quantity,
+        chainQuantity,
+        orderSide: orderSide,
+      });
+
+      // Create the limit order message
+      msg = MsgCreateSpotLimitOrder.fromJSON({
+        subaccountId,
+        injectiveAddress,
+        orderType: orderTypeValue, // 1 for buy, 2 for sell
+        price: chainPrice,
+        quantity: chainQuantity,
+        marketId: marketWithMultipliers.marketId,
+        feeRecipient, // Where trading fees go
+      });
+      
+      console.log("Limit order message created:", msg);
+```
+
+**What's in this message?**
+
+- **subaccountId**: Which trading account is placing the order
+- **orderType**: Buy (1) or Sell (2)
+- **price**: The exact price you want (in blockchain format)
+- **quantity**: How much you want to trade (in blockchain format)
+- **marketId**: Which trading pair (like INJ/USDT)
+- **feeRecipient**: Usually your own address (you can optionally earn fee rebates)
+
+### Step 6h: Creating the Order Message - Market Orders
+
+Now let's handle market orders:
+
+```typescript
+    } else {
+      console.log("Creating market order message...");
+      
+      // For market orders, use the current market price from orderbook
+      const marketPrice = currentPrice;
+      
+      // Convert current market price to blockchain format
+      const chainPrice = spotPriceToChainPriceToFixed({
+        value: marketPrice,
+        tensMultiplier: marketWithMultipliers.priceTensMultiplier,
+        baseDecimals: marketWithMultipliers.baseDecimals,
+        quoteDecimals: marketWithMultipliers.quoteDecimals,
+      });
+
+      // Convert quantity to blockchain format
+      const chainQuantity = spotQuantityToChainQuantityToFixed({
+        value: parseFloat(quantity),
+        tensMultiplier: marketWithMultipliers.quantityTensMultiplier,
+        baseDecimals: marketWithMultipliers.baseDecimals,
+      });
+
+      console.log("Market order details:", {
+        currentMarketPrice: marketPrice,
+        chainPrice,
+        userQuantity: quantity,
+        chainQuantity,
+        orderSide: orderSide,
+      });
+
+      // Create the market order message
+      msg = MsgCreateSpotMarketOrder.fromJSON({
+        subaccountId,
+        injectiveAddress,
+        orderType: orderTypeValue, // 1 for buy, 2 for sell
+        price: chainPrice, // Uses current market price
+        quantity: chainQuantity,
+        marketId: marketWithMultipliers.marketId,
+        feeRecipient,
+      });
+      
+      console.log("Market order message created:", msg);
+    }
+```
+
+**Key Difference:**
+
+- **Limit orders**: Execute at the exact price you specify (or better)
+- **Market orders**: Execute immediately at the best available price
+
+Market orders use the current orderbook price as the starting point, but may execute at slightly different prices depending on available liquidity.
+
+### Step 6i: EIP712 Signing, Transaction Creation, and Broadcasting
+
+Now we complete the transaction flow - from EIP712 signing through MetaMask to broadcasting on Injective:
+
+```typescript
+    /** --- EIP712 SIGNING FLOW START --- */
+    console.log("Starting EIP712 signing flow...");
+    
+    // Network configuration
+    const chainId = ChainId.Testnet;
+    const evmChainID = EvmChainId.TestnetEvm;
+    const rest = getNetworkEndpoints(Network.Testnet).rest;
+
+    // Use account details for transaction
+    const currentAccountNumber = accountNumber;
+    const currentSequence = sequence;
+
+    // Fetch latest block height for timeout calculation
+    const chainRestTendermintApi = new ChainRestTendermintApi(rest);
+    const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
+    const latestHeight = latestBlock.header.height;
+    const timeoutHeight = new BigNumberInBase(latestHeight).plus(
+      DEFAULT_BLOCK_TIMEOUT_HEIGHT
+    );
+
+    // Create EIP712 typed data (what MetaMask shows users)
+    const eip712TypedData = getEip712TypedData({
+      msgs: [msg],
+      tx: {
+        accountNumber: currentAccountNumber.toString(),
+        sequence: currentSequence.toString(),
+        timeoutHeight: timeoutHeight.toFixed(),
+        chainId,
+      },
+      evmChainId: evmChainID,
+    });
+
+    // Request signature from MetaMask
+    console.log("Requesting signature from MetaMask...");
+    const ethereum = getEthereum();
+    const signature = await ethereum.request({
+      method: "eth_signTypedData_v4",
+      params: [addresses[0], JSON.stringify(eip712TypedData)],
+    });
+
+    // Recover public key from signature
+    const publicKeyHex = recoverTypedSignaturePubKey(eip712TypedData, signature);
+    const publicKeyBase64 = hexToBase64(publicKeyHex);
+    const signatureBuff = Buffer.from(signature.replace("0x", ""), "hex");
+
+    // Create the transaction
+    const { txRaw } = createTransaction({
+      message: [msg],
+      memo: `${orderType.toUpperCase()} ${orderSide.toUpperCase()} order via Injective Trading App`,
+      signMode: SIGN_AMINO,
+      fee: DEFAULT_STD_FEE,
+      pubKey: publicKeyBase64,
+      sequence: currentSequence,
+      timeoutHeight: timeoutHeight.toNumber(),
+      accountNumber: currentAccountNumber,
+      chainId,
+    });
+
+    // Create EIP712 transaction and attach signature
+    const web3Extension = createWeb3Extension({ evmChainId: evmChainID });
+    const txRawEip712 = createTxRawEIP712(txRaw, web3Extension);
+    txRawEip712.signatures = [signatureBuff];
+
+    // Broadcast to Injective network
+    console.log("Broadcasting transaction to Injective...");
+    const txRestApi = new TxGrpcApi(rest);
+    const txResponse = await txRestApi.broadcast(txRawEip712);
+    
+    // Wait for confirmation
+    console.log("Waiting for transaction confirmation...");
+    const response = await txRestApi.fetchTxPoll(txResponse.txHash);
+    console.log("✅ Transaction confirmed:", response);
+```
+
+**What's happening in this complete flow:**
+
+1. **EIP712 Setup**: Configure network and transaction timeout (90 blocks ≈ 90 seconds)
+2. **Typed Data**: Create human-readable transaction data for MetaMask to display
+3. **User Approval**: MetaMask pops up, user reviews and signs
+4. **Public Key Recovery**: Extract public key from signature to prove authenticity
+5. **Transaction Building**: Package everything into a blockchain transaction
+6. **Broadcasting**: Send to Injective's network
+7. **Confirmation**: Wait for validators to include it in a block (~2-3 seconds)
+
+**Key concepts:**
+
+- **EIP712**: Standard for showing structured data in MetaMask (not just random hashes)
+- **Timeout Height**: Transaction expires after 90 blocks if not processed
+- **Public Key Recovery**: Proves the signature is valid without exposing private key
+- **Broadcasting vs Confirmation**: Broadcasting is instant, confirmation takes ~2-3 seconds
+
+### Step 6j: Post-Transaction Cleanup and Success
+
+Finally, handle success and update the UI:
+
+```typescript
+    // CRITICAL: Increment sequence after successful broadcast
+    // This allows the next transaction to have the correct sequence number
+    setSequence((prev) => prev + 1);
+    console.log("Sequence incremented to:", sequence + 1);
+
+    // Show success message with transaction hash
+    setOrderSuccess(
+      `✅ Order placed successfully!\nTransaction Hash: ${txResponse.txHash}\n\nYour order has been broadcast to the Injective blockchain.`
+    );
+
+    // Reset form inputs
+    setPrice("");
+    setQuantity("");
+
+    // Refresh user data after a short delay (let blockchain update)
+    setTimeout(() => {
+      console.log("Refreshing user data...");
+      refreshUserData();
+    }, 2000);
+
   } catch (err) {
-    console.error("Order placement failed:", err);
-    setOrderError(err instanceof Error ? err.message : "Failed to place order");
+    console.error("❌ Error placing order:", err);
+    setOrderError(
+      err instanceof Error ? err.message : "Failed to place order"
+    );
   } finally {
     setIsPlacingOrder(false);
   }
 };
 ```
 
-### Step 6c: Market Information and Multipliers
+**Critical detail: Sequence incrementing**
+After a successful transaction, we **must** increment the sequence number. This ensures the next transaction uses the correct sequence. Think of it like writing check numbers - each check needs a unique, sequential number.
 
-Next, we need to prepare the market information and mathematical multipliers for price conversion:
+**Why setTimeout for refresh?**
+The blockchain needs a moment to update your balances after the transaction. We wait 2 seconds to ensure the data is fresh when we refresh.
 
-```tsx
-// filepath: src/App.tsx
-// Inside the try block of handlePlaceOrder
-// Prepare market information
-const market = {
-  marketId: currentMarket.marketId,
-  baseDecimals: currentMarket.baseToken?.decimals || 18,
-  quoteDecimals: currentMarket.quoteToken?.decimals || 6,
-  minPriceTickSize: currentMarket.minPriceTickSize,
-  minQuantityTickSize: currentMarket.minQuantityTickSize,
-};
+### Step 6k: Adding Helper Functions and Auto-Clear Logic
 
-// Get mathematical multipliers for price/quantity conversion
-const tensMultipliers = getSpotMarketTensMultiplier({
-  baseDecimals: market.baseDecimals,
-  quoteDecimals: market.quoteDecimals,
-  minPriceTickSize: market.minPriceTickSize,
-  minQuantityTickSize: market.minQuantityTickSize,
-});
-
-const marketWithMultipliers = {
-  ...market,
-  priceTensMultiplier: tensMultipliers.priceTensMultiplier,
-  quantityTensMultiplier: tensMultipliers.quantityTensMultiplier,
-};
-```
-
-### Step 6d: Creating Order Messages
-
-Now we'll create the order message for the blockchain:
-
-```tsx
-// filepath: src/App.tsx
-// Create subaccount ID (your trading account on Injective)
-const ethereumAddress = getEthereumAddress(injectiveAddress);
-const subaccountIndex = 0; // Most users use subaccount 0
-const suffix = "0".repeat(23) + subaccountIndex;
-const subaccountId = ethereumAddress + suffix;
-
-// Determine order details
-const orderTypeValue = orderSide === "buy" ? 1 : 2; // 1 = Buy, 2 = Sell
-const feeRecipient = injectiveAddress;
-
-let msg; // This will hold our order message
-
-if (orderType === "limit") {
-  // Convert user-friendly numbers to blockchain format
-  const chainPrice = spotPriceToChainPriceToFixed({
-    value: parseFloat(price),
-    tensMultiplier: marketWithMultipliers.priceTensMultiplier,
-    baseDecimals: marketWithMultipliers.baseDecimals,
-    quoteDecimals: marketWithMultipliers.quoteDecimals,
-  });
-
-  const chainQuantity = spotQuantityToChainQuantityToFixed({
-    value: parseFloat(quantity),
-    tensMultiplier: marketWithMultipliers.quantityTensMultiplier,
-    baseDecimals: marketWithMultipliers.baseDecimals,
-  });
-
-  // Create the limit order message
-  msg = MsgCreateSpotLimitOrder.fromJSON({
-    subaccountId,
-    injectiveAddress,
-    orderType: orderTypeValue,
-    price: chainPrice,
-    quantity: chainQuantity,
-    marketId: marketWithMultipliers.marketId,
-    feeRecipient: feeRecipient,
-  });
-} else {
-  // Market order logic (similar pattern)
-  // ... see complete implementation in repository
-}
-```
-
-For the complete `handlePlaceOrder` function including transaction creation, signing, and broadcasting, check the [full implementation in the repository](https://github.com/Intellihackz/injective-trading-app-tutorial/blob/main/src/App.tsx).
-
-### Adding Message Display Components
-
-Now we need to show success and error messages to users. Add this helper function:
+Add these helper functions for UI management and the useEffect to auto-clear messages:
 
 ```typescript
 // filepath: src/App.tsx
@@ -1311,101 +1681,69 @@ const clearOrderMessages = () => {
   setOrderError("");
   setOrderSuccess("");
 };
+
+const refreshUserData = () => {
+  if (isConnected && injectiveAddresses.length > 0) {
+    const primaryAddress = injectiveAddresses[0];
+    console.log("Manually refreshing account data...");
+    fetchUserBalances(primaryAddress);
+    fetchUserPositions(primaryAddress);
+    // Also refresh account details to get updated sequence
+    fetchAccountDetails(primaryAddress);
+  }
+};
+
+// Clear order messages when form values change
+useEffect(() => {
+  if (orderError || orderSuccess) {
+    clearOrderMessages();
+  }
+}, [price, quantity, orderSide, orderType, selectedPair]);
 ```
 
-And add these message components to your trading form JSX (after the place order button):
+**What these do:**
 
-```typescript
-// filepath: src/App.tsx
-{orderError && (
-  <div className="order-error" style={{
-    padding: "0.5rem 1rem",
-    background: "#fee",
-    color: "#c53030",
-    fontSize: "0.85rem",
-    borderRadius: "4px",
-    margin: "0.5rem 1rem",
-    border: "1px solid #fed7d7",
-  }}>
-    <strong>Error:</strong> {orderError}
-    <button onClick={clearOrderMessages} style={{
-      float: "right",
-      background: "none",
-      border: "none",
-      color: "#c53030",
-      cursor: "pointer",
-      fontSize: "0.8rem",
-    }}>
-      ✕
-    </button>
-  </div>
-)}
+- `clearOrderMessages()` - Clears error and success messages on demand
+- `refreshUserData()` - Refreshes balances, positions, and account details
+- The useEffect creates smooth UX by clearing old messages when users start a new order
 
-{orderSuccess && (
-  <div className="order-success" style={{
-    padding: "0.5rem 1rem",
-    background: "#f0fff4",
-    color: "#22543d",
-    fontSize: "0.8rem",
-    borderRadius: "4px",
-    margin: "0.5rem 1rem",
-    border: "1px solid #9ae6b4",
-    whiteSpace: "pre-line", // This makes line breaks work in the success message
-  }}>
-    <strong>Success:</strong> {orderSuccess}
-    <button onClick={clearOrderMessages} style={{
-      float: "right",
-      background: "none",
-      border: "none",
-      color: "#22543d",
-      cursor: "pointer",
-      fontSize: "0.8rem",
-    }}>
-      ✕
-    </button>
-  </div>
-)}
-```
+---
 
-### What Just Happened?
+## Testing Your Transaction System
 
-This is a lot of code, but here's what each part does:
+Now that you understand how the transaction signing works, let's test it! Here's what should happen:
 
-1. **Validation**: Make sure we have all required inputs
-2. **Market Setup**: Prepare the trading pair information  
-3. **Format Conversion**: Convert user prices/quantities to blockchain format
-4. **Message Creation**: Build the actual order message for the blockchain
-5. **Account Info**: Get your account's sequence number (like a check number)
-6. **Transaction Building**: Package everything into a transaction
-7. **Signing**: Use MetaMask to cryptographically sign the transaction
-8. **Broadcasting**: Send it to Injective's network
-9. **Confirmation**: Wait for the blockchain to process it
+1. **Fill out the form** with quantity (and price for limit orders)
+2. **Click "Place Order"** button
+3. **MetaMask pops up** showing transaction details
+4. **Approve in MetaMask**
+5. **See success message** with transaction hash
+6. **Check Injective Explorer** to see your transaction on the blockchain!
 
-The most complex parts are the price/quantity conversions - blockchains store numbers very differently than humans read them!
+**Injective Testnet Explorer**: `https://testnet.explorer.injective.network/`
 
-### Test Your Order System
+You can paste your transaction hash there to see all the details!
 
-Save your file and try placing a small test order (make sure you have some testnet INJ for gas fees). The process should be:
+### 🎯 What You've Accomplished
 
-1. Fill out the trading form
-2. Click "Place Order"
-3. MetaMask pops up asking you to sign
-4. Success message shows with transaction hash
-5. You can check your transaction on Injective's testnet explorer!
+You now have a complete blockchain transaction system that includes:
 
-In the next step, we'll add user account data so you can see your balances and track your orders.
+✅ **Input validation** to prevent invalid orders  
+✅ **Price conversion** from human-readable to blockchain format  
+✅ **EIP712 signing** for MetaMask compatibility  
+✅ **Public key recovery** for transaction verification  
+✅ **Transaction broadcasting** to Injective's network  
+✅ **Confirmation polling** to ensure success  
+✅ **Sequence management** for multiple transactions  
+✅ **Error handling** for a smooth user experience  
 
-### Key Points
-
-- **Price/Quantity Conversion**: Critical for proper order execution on-chain
-- **Transaction Creation**: Requires account details (sequence, account number, public key)
-- **MetaMask Signing**: Convert sign bytes to hex format for compatibility
-- **Error Handling**: Comprehensive error states and user feedback
-- **Transaction Broadcasting**: Use proper REST API endpoints
+---
 
 ## Step 7: Showing User Account Information
 
 Now that users can place orders, they'll want to see their account information - what tokens do they have? What are their current balances? Any active positions? Let's build a user panel that shows all this information in real-time.
+
+> **📝 Note**: If you're following the completed repository code, the user account functionality is already implemented in your `App.tsx` file. This section explains how it works so you understand account data fetching and display.
 
 ### Understanding Injective Accounts
 
