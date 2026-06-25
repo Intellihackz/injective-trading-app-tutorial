@@ -76,7 +76,7 @@ src/
 
 ## Documentation
 
-For detailed usage instructions and trading guide, see [TUTORIAL.md](./TUTORIAL.md).
+For detailed usage instructions and trading guide, see [Tutorial](tutorial/0-setup.md).
 
 ## Contributing
 
